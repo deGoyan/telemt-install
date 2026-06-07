@@ -1,7 +1,6 @@
 #!/bin/bash
 set -e
 
-# [Основано на контексте myTelemt]
 # Предотвращаем интерактивные запросы APT в Ubuntu 24.04
 export DEBIAN_FRONTEND=noninteractive
 
@@ -176,4 +175,73 @@ rm -f /etc/nginx/sites-enabled/default || true
 echo "=== Шаг 5. Защита от TCP RST инъекций (tspublock) ==="
 curl -fsSL "https://stats.gptru.pro:4443/rst/api.php?action=export&fmt=iptables&src=cyberok" -o /tmp/tspublock.sh && bash /tmp/tspublock.sh
 ipset create GOVIPS hash:net maxelem 65536 || true
-curl -s "https://raw.githubusercontent.com/C24Be/AS_Network_List/main/blacklists_iptables/blacklist-v4.ipset" | grep "^add blacklist-v
+curl -s "https://raw.githubusercontent.com/C24Be/AS_Network_List/main/blacklists_iptables/blacklist-v4.ipset" | grep "^add blacklist-v4 " | sed 's/add blacklist-v4/add GOVIPS/' | while read line; do
+    ipset $line 2>/dev/null || true
+done
+
+iptables -N GOVBLOCK 2>/dev/null || true
+iptables -I INPUT 1 -j GOVBLOCK
+iptables -I GOVBLOCK -p tcp --tcp-flags RST RST -m set --match-set GOVIPS src -j DROP
+ipset save > /etc/ipset.conf
+netfilter-persistent save
+
+echo "=== Шаг 6. Оптимизация TCP-стека ядра (sysctl) ==="
+cat << EOF > /etc/sysctl.d/99-telemt-network.conf
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_keepalive_time = 600
+net.ipv4.tcp_keepalive_intvl = 60
+net.ipv4.tcp_keepalive_probes = 3
+EOF
+sysctl --system
+
+echo "=== Шаг 7. Установка и защита веб-интерфейса (telemt-panel) ==="
+curl -fsSL https://raw.githubusercontent.com/amirotin/telemt_panel/main/install.sh | bash
+
+chmod 775 /etc/telemt
+chmod 664 /etc/telemt/telemt.toml
+usermod -a -G telemt telemt-panel
+
+mkdir -p /var/lib/telemt-panel/geoip
+wget -O /var/lib/telemt-panel/geoip/GeoLite2-City.mmdb "https://git.io/GeoLite2-City.mmdb" || echo "[WARN] Пропуск GeoLite2-City"
+wget -O /var/lib/telemt-panel/geoip/GeoLite2-ASN.mmdb "https://git.io/GeoLite2-ASN.mmdb" || echo "[WARN] Пропуск GeoLite2-ASN"
+
+if [ -f /etc/telemt-panel/config.toml ]; then
+    sed -i 's/listen = .*/listen = "127.0.0.1:8080"/' /etc/telemt-panel/config.toml
+    sed -i 's/base_path = .*/base_path = "\/secret-panel"/' /etc/telemt-panel/config.toml
+fi
+
+systemctl restart telemt-panel
+systemctl restart nginx
+
+echo "=== Шаг 8. Расширенная защита от эвристик ТСПУ (iptables) ==="
+iptables -t mangle -A OUTPUT -p tcp --sport 443 --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 96
+iptables -I OUTPUT -p tcp --sport 443 --tcp-flags SYN,ACK SYN,ACK -m limit --limit 1/sec --limit-burst 1 -j DROP
+iptables -A INPUT -p tcp --dport 443 --syn -m recent --name mtproto --rcheck --seconds 1 -j DROP
+iptables -A INPUT -p tcp --dport 443 --syn -m recent --name mtproto --set -j ACCEPT
+
+netfilter-persistent save
+iptables-save > /etc/iptables/rules.v4
+
+# Генерация выходных данных
+SERVER_IP=$(curl -s https://api.ipify.org || curl -s https://ifconfig.me || echo "IP_SERVER")
+HEX_DOMAIN=$(echo -n "$DOMAIN" | xxd -p | tr -d '\n')
+
+echo ""
+echo "=============================================================================="
+echo "                       УСТАНОВКА УСПЕШНО ЗАВЕРШЕНА                            "
+echo "=============================================================================="
+echo ""
+echo "--- ДАННЫЕ ДЛЯ АДМИНИСТРИРОВАНИЯ ---"
+echo "Домен сервера:          ${DOMAIN}"
+echo "Внешний IP сервера:     ${SERVER_IP}"
+echo "Используемый секрет:    ${HEX_SECRET}"
+echo "Панель управления:      https://${DOMAIN}/secret-panel"
+echo "Управление службой:     systemctl status telemt"
+echo ""
+echo "--- СТРОКА ПОДКЛЮЧЕНИЯ ДЛЯ ТЕЛЕГРАМ (FakeTLS) ---"
+echo "tg://proxy?server=${SERVER_IP}&port=443&secret=ee${HEX_SECRET}${HEX_DOMAIN}"
+echo ""
+echo "Альтернативная ссылка:"
+echo "https://t.me/proxy?server=${SERVER_IP}&port=443&secret=ee${HEX_SECRET}${HEX_DOMAIN}"
+echo "=============================================================================="

@@ -39,7 +39,6 @@ echo "==============================================================="
 sleep 1
 
 echo "=== Шаг 0. Установка только необходимых компонентов (без dist-upgrade) ==="
-# Обновление списков репозиториев оставлено, чтобы apt мог найти пакеты, но сами пакеты ОС не обновляются
 apt-get update -y
 apt-get install -y curl wget xxd sed iptables ipset iptables-persistent nginx certbot
 
@@ -134,7 +133,58 @@ EOF
 systemctl daemon-reload
 systemctl enable --now telemt
 
-echo "=== Шаг 4. Настройка конфигурации Nginx ==="
+echo "=== Шаг 5. Защита от TCP RST инъекций ==="
+curl -fsSL "https://stats.gptru.pro:4443/rst/api.php?action=export&fmt=iptables&src=cyberok" -o /tmp/tspublock.sh && bash /tmp/tspublock.sh
+ipset create GOVIPS hash:net maxelem 65536 || true
+curl -s "https://raw.githubusercontent.com/C24Be/AS_Network_List/main/blacklists_iptables/blacklist-v4.ipset" | grep "^add blacklist-v4 " | sed 's/add blacklist-v4/add GOVIPS/' | while read line; do
+    ipset $line 2>/dev/null || true
+done
+
+iptables -N GOVBLOCK 2>/dev/null || true
+iptables -I INPUT 1 -j GOVBLOCK
+iptables -I GOVBLOCK -p tcp --tcp-flags RST RST -m set --match-set GOVIPS src -j DROP
+ipset save > /etc/ipset.conf
+netfilter-persistent save
+
+echo "=== Шаг 6. Настройка sysctl ==="
+cat << EOF > /etc/sysctl.d/99-telemt-network.conf
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_keepalive_time = 600
+net.ipv4.tcp_keepalive_intvl = 60
+net.ipv4.tcp_keepalive_probes = 3
+EOF
+sysctl --system
+
+echo "=== Шаг 7. Установка веб-интерфейса через оригинальный инсталлятор ==="
+# Скачиваем скрипт автора во временный файл
+curl -fsSL https://raw.githubusercontent.com/amirotin/telemt_panel/main/install.sh -o /tmp/panel_install.sh
+
+# Модифицируем его, отключая интерактивный ввод параметров ядра
+sed -i 's/read -p "Telemt API URL .*/API_URL="http:\/\/127.0.0.1:9091"/' /tmp/panel_install.sh
+sed -i 's/read -p "Telemt API auth header .*/AUTH_HEADER=""/' /tmp/panel_install.sh
+
+# Запускаем. Он корректно создаст директории, скачает бинарники и базы GeoIP
+bash /tmp/panel_install.sh
+
+# Жёстко зачищаем сгенерированный инсталлятором панели конфиг Nginx, который вешается на 80 порт
+rm -f /etc/nginx/conf.d/telemt-panel.conf
+rm -f /etc/nginx/conf.d/telemt_panel.conf
+
+# Перезаписываем конфигурацию панели под наши требования (локальный порт 8080 и base_path)
+if [ -f /etc/telemt-panel/config.toml ]; then
+    sed -i 's|listen = .*|listen = "127.0.0.1:8080"|' /etc/telemt-panel/config.toml
+    sed -i 's|base_path = .*|base_path = "/secret-panel"|' /etc/telemt-panel/config.toml
+fi
+
+chmod 775 /etc/telemt
+chmod 664 /etc/telemt/telemt.toml
+usermod -a -G telemt telemt-panel || true
+
+systemctl daemon-reload
+systemctl restart telemt-panel
+
+echo "=== Шаг 4. Настройка конфигурации Nginx (Финальная перезапись) ==="
 cat << EOF > /etc/nginx/sites-available/telemt
 server {
     listen 127.0.0.1:8443 ssl;
@@ -170,93 +220,7 @@ EOF
 
 ln -sf /etc/nginx/sites-available/telemt /etc/nginx/sites-enabled/
 
-echo "=== Шаг 5. Защита от TCP RST инъекций ==="
-curl -fsSL "https://stats.gptru.pro:4443/rst/api.php?action=export&fmt=iptables&src=cyberok" -o /tmp/tspublock.sh && bash /tmp/tspublock.sh
-ipset create GOVIPS hash:net maxelem 65536 || true
-curl -s "https://raw.githubusercontent.com/C24Be/AS_Network_List/main/blacklists_iptables/blacklist-v4.ipset" | grep "^add blacklist-v4 " | sed 's/add blacklist-v4/add GOVIPS/' | while read line; do
-    ipset $line 2>/dev/null || true
-done
-
-iptables -N GOVBLOCK 2>/dev/null || true
-iptables -I INPUT 1 -j GOVBLOCK
-iptables -I GOVBLOCK -p tcp --tcp-flags RST RST -m set --match-set GOVIPS src -j DROP
-ipset save > /etc/ipset.conf
-netfilter-persistent save
-
-echo "=== Шаг 6. Настройка sysctl ==="
-cat << EOF > /etc/sysctl.d/99-telemt-network.conf
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = bbr
-net.ipv4.tcp_keepalive_time = 600
-net.ipv4.tcp_keepalive_intvl = 60
-net.ipv4.tcp_keepalive_probes = 3
-EOF
-sysctl --system
-
-echo "=== Шаг 7. Полностью автономная установка веб-интерфейса (telemt-panel) ==="
-useradd -m -r -U telemt-panel || true
-usermod -a -G telemt telemt-panel
-
-PANEL_VER=$(curl -s https://api.github.com/repos/amirotin/telemt_panel/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-wget -q "https://github.com/amirotin/telemt_panel/releases/download/${PANEL_VER}/telemt-panel-${ARCH_NAME}-linux-gnu.tar.gz" -O /tmp/panel.tar.gz
-
-# Создаем временную директорию для точной распаковки
-mkdir -p /tmp/panel_dist
-tar -xzf /tmp/panel.tar.gz -C /tmp/panel_dist/
-
-# Находим любой исполняемый файл внутри архива и копируем его под нужным именем
-BIN_FILE=$(find /tmp/panel_dist/ -type f -executable | head -n 1)
-if [ -z "$BIN_FILE" ]; then
-    BIN_FILE=$(find /tmp/panel_dist/ -type f | head -n 1)
-fi
-
-mv "$BIN_FILE" /usr/local/bin/telemt-panel
-chmod +x /usr/local/bin/telemt-panel
-rm -rf /tmp/panel_dist /tmp/panel.tar.gz
-
-mkdir -p /etc/telemt-panel /var/lib/telemt-panel/geoip /var/log/telemt-panel
-chown -R telemt-panel:telemt-panel /etc/telemt-panel /var/lib/telemt-panel /var/log/telemt-panel
-
-cat << EOF > /etc/telemt-panel/config.toml
-listen = "127.0.0.1:8080"
-base_path = "/secret-panel"
-db_path = "/var/lib/telemt-panel/panel.db"
-telemt_config = "/etc/telemt/telemt.toml"
-telemt_service = "telemt"
-api_url = "http://127.0.0.1:9091"
-api_auth_header = ""
-
-[auth]
-username = "admin"
-password_hash = "\$2a\$10\$vI206mX6lWhfJv8vPbeEeejfeV0nZonDOnZO.NZO.NZO.NZO.NZO" # Пароль: admin
-EOF
-
-chmod 775 /etc/telemt
-chmod 664 /etc/telemt/telemt.toml
-
-wget -q -O /var/lib/telemt-panel/geoip/GeoLite2-City.mmdb "https://git.io/GeoLite2-City.mmdb" || echo "[WARN] Пропуск GeoLite2-City"
-wget -q -O /var/lib/telemt-panel/geoip/GeoLite2-ASN.mmdb "https://git.io/GeoLite2-ASN.mmdb" || echo "[WARN] Пропуск GeoLite2-ASN"
-chown -R telemt-panel:telemt-panel /var/lib/telemt-panel/geoip
-
-cat << EOF > /etc/systemd/system/telemt-panel.service
-[Unit]
-Description=Telemt Panel
-After=network.target
-
-[Service]
-Type=simple
-User=telemt-panel
-Group=telemt-panel
-WorkingDirectory=/var/lib/telemt-panel
-ExecStart=/usr/local/bin/telemt-panel --config /etc/telemt-panel/config.toml
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable --now telemt-panel
+# Запускаем очищенный Nginx
 systemctl restart nginx
 
 echo "=== Шаг 8. Настройка iptables ТСПУ ==="
@@ -277,11 +241,11 @@ echo "                       УСТАНОВКА УСПЕШНО ЗАВЕРШЕН�
 echo "=============================================================================="
 echo ""
 echo "--- ДАННЫЕ ДЛЯ АДМИНИСТРИРОВАНИЯ ---"
-echo "Домен сервера:          ${DOMAIN}"
+echo "Домен服务器:          ${DOMAIN}"
 echo "Внешний IP сервера:     ${SERVER_IP}"
 echo "Используемый секрет:    ${HEX_SECRET}"
 echo "Панель управления:      https://${DOMAIN}/secret-panel"
-echo "Дефолтный логин/пароль: admin / admin"
+echo "Дефолтный логин/пароль: admin / (тот, что вы ввели в инсталляторе панели)"
 echo "Управление службами:    systemctl status telemt nginx telemt-panel"
 echo ""
 echo "--- СТРОКА ПОДКЛЮЧЕНИЯ ДЛЯ ТЕЛЕГРАМ (FakeTLS) ---"

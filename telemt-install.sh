@@ -5,7 +5,7 @@ set -e
 export DEBIAN_FRONTEND=noninteractive
 
 echo "================================================================"
-echo "=== Тестовая автоматическая установка Telemt (Ubuntu 24.04) ==="
+echo "=== Автоматическая установка Telemt (Ubuntu 24.04)           ==="
 echo "================================================================"
 echo ""
 
@@ -38,16 +38,19 @@ echo "HEX-секрет: $HEX_SECRET"
 echo "==============================================================="
 sleep 1
 
-echo "=== Шаг 0. Установка только необходимых компонентов (без dist-upgrade) ==="
+echo "=== Шаг 0. Установка необходимых компонентов ==="
 apt-get update -y
 apt-get install -y curl wget xxd sed iptables ipset iptables-persistent nginx certbot
 
 echo "iptables-persistent iptables-persistent/tosave_v4 boolean true" | debconf-set-selections
 echo "iptables-persistent iptables-persistent/tosave_v6 boolean true" | debconf-set-selections
 
-# Очищаем дефолтные конфиги Nginx, чтобы исключить конфликты портов
+# Очищаем старые конфиги Nginx и панели во избежание конфликтов
 rm -f /etc/nginx/sites-enabled/default
 rm -f /etc/nginx/conf.d/default.conf
+rm -f /etc/nginx/conf.d/telemt-panel.conf
+rm -f /etc/nginx/conf.d/telemt_panel.conf
+rm -f /etc/telemt-panel/config.toml
 
 # Временно останавливаем Nginx для работы certbot
 systemctl stop nginx || true
@@ -164,9 +167,11 @@ sed -i 's/read -p "Telemt API auth header .*/AUTH_HEADER=""/' /tmp/panel_install
 
 bash /tmp/panel_install.sh
 
+# Удаляем конфликтующие файлы конфигурации Nginx от панели
 rm -f /etc/nginx/conf.d/telemt-panel.conf
 rm -f /etc/nginx/conf.d/telemt_panel.conf
 
+# Настройка конфигурации панели (порт 8080 и путь)
 if [ -f /etc/telemt-panel/config.toml ]; then
     sed -i 's|listen = .*|listen = "127.0.0.1:8080"|' /etc/telemt-panel/config.toml
     sed -i 's|base_path = .*|base_path = "/secret-panel"|' /etc/telemt-panel/config.toml
@@ -179,11 +184,11 @@ usermod -a -G telemt telemt-panel || true
 systemctl daemon-reload
 systemctl restart telemt-panel
 
-echo "=== Шаг 4. Настройка конфигурации Nginx (Финальная перезапись) ==="
+echo "=== Шаг 4. Настройка конфигурации Nginx ==="
 cat << EOF > /etc/nginx/sites-available/telemt
 server {
-    # Изменено: http2 перенесен в строку listen для совместимости с Nginx 1.24 в Ubuntu 24.04
-    listen 127.0.0.1:8443 ssl http2;
+    # Исправлено: слушаем все интерфейсы на порту 8443, чтобы принимать трафик от ядра
+    listen 8443 ssl http2;
     server_name ${DOMAIN};
 
     ssl_certificate /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
@@ -214,11 +219,16 @@ server {
 EOF
 
 ln -sf /etc/nginx/sites-available/telemt /etc/nginx/sites-enabled/
-
-# Запускаем очищенный Nginx
 systemctl restart nginx
 
 echo "=== Шаг 8. Настройка iptables ТСПУ ==="
+# Очищаем старые тестовые правила цепочек INPUT/OUTPUT для исключения дублирования
+iptables -t mangle -D OUTPUT -p tcp --sport 443 --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 96 2>/dev/null || true
+iptables -D OUTPUT -p tcp --sport 443 --tcp-flags SYN,ACK SYN,ACK -m limit --limit 1/sec --limit-burst 1 -j DROP 2>/dev/null || true
+iptables -D INPUT -p tcp --dport 443 --syn -m recent --name mtproto --rcheck --seconds 1 -j DROP 2>/dev/null || true
+iptables -D INPUT -p tcp --dport 443 --syn -m recent --name mtproto --set -j ACCEPT 2>/dev/null || true
+
+# Применяем корректные правила из руководства myTelemt
 iptables -t mangle -A OUTPUT -p tcp --sport 443 --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 96
 iptables -I OUTPUT -p tcp --sport 443 --tcp-flags SYN,ACK SYN,ACK -m limit --limit 1/sec --limit-burst 1 -j DROP
 iptables -A INPUT -p tcp --dport 443 --syn -m recent --name mtproto --rcheck --seconds 1 -j DROP
@@ -227,7 +237,6 @@ iptables -A INPUT -p tcp --dport 443 --syn -m recent --name mtproto --set -j ACC
 netfilter-persistent save
 iptables-save > /etc/iptables/rules.v4
 
-SERVER_IP=$(curl -s https://api.ipify.org || curl -s https://ifconfig.me || echo "IP_SERVER")
 HEX_DOMAIN=$(echo -n "$DOMAIN" | xxd -p | tr -d '\n')
 
 echo ""
@@ -237,15 +246,14 @@ echo "==========================================================================
 echo ""
 echo "--- ДАННЫЕ ДЛЯ АДМИНИСТРИРОВАНИЯ ---"
 echo "Домен сервера:          ${DOMAIN}"
-echo "Внешний IP сервера:     ${SERVER_IP}"
 echo "Используемый секрет:    ${HEX_SECRET}"
 echo "Панель управления:      https://${DOMAIN}/secret-panel"
 echo "Дефолтный логин/пароль: admin / (тот, что вы ввели в инсталляторе панели)"
 echo "Управление службами:    systemctl status telemt nginx telemt-panel"
 echo ""
-echo "--- СТРОКА ПОДКЛЮЧЕНИЯ ДЛЯ ТЕЛЕГРАМ (FakeTLS) ---"
-echo "tg://proxy?server=${SERVER_IP}&port=443&secret=ee${HEX_SECRET}${HEX_DOMAIN}"
+echo "--- СТРОКА ПОДКЛЮЧЕНИЯ ДЛЯ ТЕЛЕГРАМ (FakeTLS с Доменом) ---"
+echo "tg://proxy?server=${DOMAIN}&port=443&secret=ee${HEX_SECRET}${HEX_DOMAIN}"
 echo ""
 echo "Альтернативная ссылка:"
-echo "https://t.me/proxy?server=${SERVER_IP}&port=443&secret=ee${HEX_SECRET}${HEX_DOMAIN}"
+echo "https://t.me/proxy?server=${DOMAIN}&port=443&secret=ee${HEX_SECRET}${HEX_DOMAIN}"
 echo "=============================================================================="

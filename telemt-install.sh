@@ -5,11 +5,11 @@ set -e
 export DEBIAN_FRONTEND=noninteractive
 
 echo "================================================================"
-echo "=== Интерактивная настройка Telemt + Certbot (Ubuntu 24.04) ==="
+echo "=== Полная автоматическая установка Telemt (Ubuntu 24.04)   ==="
 echo "================================================================"
 echo ""
 
-# 1. Запрос домена
+# 1. Запрос параметров у пользователя в самом начале
 while [ -z "$DOMAIN" ]; do
     read -p "Введите ваш домен (A-запись должна указывать на этот IP): " DOMAIN
     if [ -z "$DOMAIN" ]; then
@@ -17,7 +17,6 @@ while [ -z "$DOMAIN" ]; do
     fi
 done
 
-# 2. Запрос HEX-секрета
 read -p "Введите 32-значный HEX-секрет (оставьте пустым для автогенерации): " USER_SECRET
 
 if [ -z "$USER_SECRET" ]; then
@@ -33,33 +32,28 @@ else
 fi
 
 echo ""
-echo "=== Параметры приняты. Начинается установка ==="
+echo "=== Все параметры получены. Начинается автономный процесс ==="
 echo "Домен: $DOMAIN"
 echo "HEX-секрет: $HEX_SECRET"
-echo "==============================================="
+echo "==============================================================="
 sleep 2
 
-echo "=== Шаг 0. Обновление ОС и установка базовых компонентов ==="
+echo "=== Шаг 0. Обновление ОС и установка компонентов ==="
 apt-get update -y
 apt-get upgrade -y -o Dpkg::Options::="--force-confold"
-
-# Установка системных утилит и certbot
 apt-get install -y curl wget xxd sed iptables ipset iptables-persistent nginx certbot
 
 echo "iptables-persistent iptables-persistent/tosave_v4 boolean true" | debconf-set-selections
 echo "iptables-persistent iptables-persistent/tosave_v6 boolean true" | debconf-set-selections
 
-# Временно останавливаем дефолтный Nginx, чтобы освободить 80 порт для утилиты certbot
+# Временно останавливаем Nginx для работы certbot
 systemctl stop nginx
 
-echo "=== Шаг 0.1. Автоматическое получение SSL-сертификата Let's Encrypt ==="
-# Запрашиваем сертификат в режиме standalone без указания email
+echo "=== Шаг 0.1. Получение SSL-сертификата Let's Encrypt ==="
 certbot certonly --standalone --non-interactive --agree-tos --register-unsafely-without-email -d "${DOMAIN}"
 
-# Проверяем физическое наличие файлов сертификатов перед продолжением
 if [ ! -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]; then
-    echo "Ошибка: Не удалось получить SSL-сертификат для домена ${DOMAIN}."
-    echo "Проверьте, что A-запись домена указывает на IP этого сервера, и порт 80 открыт."
+    echo "Ошибка: Сертификат не найден по пути /etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
     exit 1
 fi
 
@@ -68,7 +62,7 @@ wget -qO- "https://github.com/telemt/telemt/releases/latest/download/telemt-$(un
 mv telemt /bin/telemt
 chmod +x /bin/telemt
 
-echo "=== Шаг 2. Базовая конфигурация ==="
+echo "=== Шаг 2. Базовая конфигурация ядра ==="
 mkdir -p /etc/telemt
 
 cat << EOF > /etc/telemt/telemt.toml
@@ -106,7 +100,7 @@ tls_front_dir = "tlsfront"
 tg_user = "${HEX_SECRET}"
 EOF
 
-echo "=== Шаг 3. Изоляция службы Systemd ==="
+echo "=== Шаг 3. Создание службы Systemd ==="
 useradd -d /etc/telemt -m -r -U telemt || true
 chown -R telemt:telemt /etc/telemt
 
@@ -135,7 +129,7 @@ EOF
 systemctl daemon-reload
 systemctl enable --now telemt
 
-echo "=== Шаг 4. Настройка Nginx-заглушки ==="
+echo "=== Шаг 4. Настройка Nginx ==="
 cat << EOF > /etc/nginx/sites-available/telemt
 server {
     listen 127.0.0.1:8443 ssl;
@@ -172,7 +166,7 @@ EOF
 ln -sf /etc/nginx/sites-available/telemt /etc/nginx/sites-enabled/
 rm -f /etc/nginx/sites-enabled/default || true
 
-echo "=== Шаг 5. Защита от TCP RST инъекций (tspublock) ==="
+echo "=== Шаг 5. Защита от TCP RST инъекций ==="
 curl -fsSL "https://stats.gptru.pro:4443/rst/api.php?action=export&fmt=iptables&src=cyberok" -o /tmp/tspublock.sh && bash /tmp/tspublock.sh
 ipset create GOVIPS hash:net maxelem 65536 || true
 curl -s "https://raw.githubusercontent.com/C24Be/AS_Network_List/main/blacklists_iptables/blacklist-v4.ipset" | grep "^add blacklist-v4 " | sed 's/add blacklist-v4/add GOVIPS/' | while read line; do
@@ -185,7 +179,7 @@ iptables -I GOVBLOCK -p tcp --tcp-flags RST RST -m set --match-set GOVIPS src -j
 ipset save > /etc/ipset.conf
 netfilter-persistent save
 
-echo "=== Шаг 6. Оптимизация TCP-стека ядра (sysctl) ==="
+echo "=== Шаг 6. Настройка sysctl ==="
 cat << EOF > /etc/sysctl.d/99-telemt-network.conf
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
@@ -195,8 +189,16 @@ net.ipv4.tcp_keepalive_probes = 3
 EOF
 sysctl --system
 
-echo "=== Шаг 7. Установка и защита веб-интерфейса (telemt-panel) ==="
-curl -fsSL https://raw.githubusercontent.com/amirotin/telemt_panel/main/install.sh | bash
+echo "=== Шаг 7. Установка telemt-panel (Полный silent-режим) ==="
+# Скачиваем оригинальный скрипт панели во временный файл
+curl -fsSL https://raw.githubusercontent.com/amirotin/telemt_panel/main/install.sh -o /tmp/panel_install.sh
+
+# С помощью sed вырезаем из него интерактивные вопросы `read`, жестко задавая нужные параметры
+sed -i 's/read -p "Telemt API URL .*/API_URL="http:\/\/127.0.0.1:9091"/' /tmp/panel_install.sh
+sed -i 's/read -p "Telemt API auth header .*/AUTH_HEADER=""/' /tmp/panel_install.sh
+
+# Запускаем модифицированный скрипт панели, он пройдет без единого вопроса
+bash /tmp/panel_install.sh
 
 chmod 775 /etc/telemt
 chmod 664 /etc/telemt/telemt.toml
@@ -211,10 +213,11 @@ if [ -f /etc/telemt-panel/config.toml ]; then
     sed -i 's/base_path = .*/base_path = "\/secret-panel"/' /etc/telemt-panel/config.toml
 fi
 
+systemctl daemon-reload
 systemctl restart telemt-panel
 systemctl restart nginx
 
-echo "=== Шаг 8. Расширенная защита от эвристик ТСПУ (iptables) ==="
+echo "=== Шаг 8. Настройка iptables ТСПУ ==="
 iptables -t mangle -A OUTPUT -p tcp --sport 443 --tcp-flags SYN,ACK SYN,ACK -j TCPMSS --set-mss 96
 iptables -I OUTPUT -p tcp --sport 443 --tcp-flags SYN,ACK SYN,ACK -m limit --limit 1/sec --limit-burst 1 -j DROP
 iptables -A INPUT -p tcp --dport 443 --syn -m recent --name mtproto --rcheck --seconds 1 -j DROP
@@ -223,7 +226,7 @@ iptables -A INPUT -p tcp --dport 443 --syn -m recent --name mtproto --set -j ACC
 netfilter-persistent save
 iptables-save > /etc/iptables/rules.v4
 
-# Генерация выходных данных
+# Вывод финальных данных
 SERVER_IP=$(curl -s https://api.ipify.org || curl -s https://ifconfig.me || echo "IP_SERVER")
 HEX_DOMAIN=$(echo -n "$DOMAIN" | xxd -p | tr -d '\n')
 

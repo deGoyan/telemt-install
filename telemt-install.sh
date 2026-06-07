@@ -199,9 +199,20 @@ usermod -a -G telemt telemt-panel
 
 PANEL_VER=$(curl -s https://api.github.com/repos/amirotin/telemt_panel/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
 wget -q "https://github.com/amirotin/telemt_panel/releases/download/${PANEL_VER}/telemt-panel-${ARCH_NAME}-linux-gnu.tar.gz" -O /tmp/panel.tar.gz
-tar -xzf /tmp/panel.tar.gz -C /tmp/
-mv /tmp/telemt-panel /usr/local/bin/telemt-panel
+
+# Создаем временную директорию для точной распаковки
+mkdir -p /tmp/panel_dist
+tar -xzf /tmp/panel.tar.gz -C /tmp/panel_dist/
+
+# Находим любой исполняемый файл внутри архива и копируем его под нужным именем
+BIN_FILE=$(find /tmp/panel_dist/ -type f -executable | head -n 1)
+if [ -z "$BIN_FILE" ]; then
+    BIN_FILE=$(find /tmp/panel_dist/ -type f | head -n 1)
+fi
+
+mv "$BIN_FILE" /usr/local/bin/telemt-panel
 chmod +x /usr/local/bin/telemt-panel
+rm -rf /tmp/panel_dist /tmp/panel.tar.gz
 
 mkdir -p /etc/telemt-panel /var/lib/telemt-panel/geoip /var/log/telemt-panel
 chown -R telemt-panel:telemt-panel /etc/telemt-panel /var/lib/telemt-panel /var/log/telemt-panel

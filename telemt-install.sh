@@ -157,21 +157,16 @@ EOF
 sysctl --system
 
 echo "=== Шаг 7. Установка веб-интерфейса через оригинальный инсталлятор ==="
-# Скачиваем скрипт автора во временный файл
 curl -fsSL https://raw.githubusercontent.com/amirotin/telemt_panel/main/install.sh -o /tmp/panel_install.sh
 
-# Модифицируем его, отключая интерактивный ввод параметров ядра
 sed -i 's/read -p "Telemt API URL .*/API_URL="http:\/\/127.0.0.1:9091"/' /tmp/panel_install.sh
 sed -i 's/read -p "Telemt API auth header .*/AUTH_HEADER=""/' /tmp/panel_install.sh
 
-# Запускаем. Он корректно создаст директории, скачает бинарники и базы GeoIP
 bash /tmp/panel_install.sh
 
-# Жёстко зачищаем сгенерированный инсталлятором панели конфиг Nginx, который вешается на 80 порт
 rm -f /etc/nginx/conf.d/telemt-panel.conf
 rm -f /etc/nginx/conf.d/telemt_panel.conf
 
-# Перезаписываем конфигурацию панели под наши требования (локальный порт 8080 и base_path)
 if [ -f /etc/telemt-panel/config.toml ]; then
     sed -i 's|listen = .*|listen = "127.0.0.1:8080"|' /etc/telemt-panel/config.toml
     sed -i 's|base_path = .*|base_path = "/secret-panel"|' /etc/telemt-panel/config.toml
@@ -187,8 +182,8 @@ systemctl restart telemt-panel
 echo "=== Шаг 4. Настройка конфигурации Nginx (Финальная перезапись) ==="
 cat << EOF > /etc/nginx/sites-available/telemt
 server {
-    listen 127.0.0.1:8443 ssl;
-    http2 on;
+    # Изменено: http2 перенесен в строку listen для совместимости с Nginx 1.24 в Ubuntu 24.04
+    listen 127.0.0.1:8443 ssl http2;
     server_name ${DOMAIN};
 
     ssl_certificate /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
@@ -241,7 +236,7 @@ echo "                       УСТАНОВКА УСПЕШНО ЗАВЕРШЕН�
 echo "=============================================================================="
 echo ""
 echo "--- ДАННЫЕ ДЛЯ АДМИНИСТРИРОВАНИЯ ---"
-echo "Домен服务器:          ${DOMAIN}"
+echo "Домен сервера:          ${DOMAIN}"
 echo "Внешний IP сервера:     ${SERVER_IP}"
 echo "Используемый секрет:    ${HEX_SECRET}"
 echo "Панель управления:      https://${DOMAIN}/secret-panel"

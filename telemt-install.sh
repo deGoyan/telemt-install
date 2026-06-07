@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-# Предотвращаем интерактивные запросы APT в Ubuntu 24.04
+# Предотвращаем любые интерактивные запросы APT в Ubuntu 24.04
 export DEBIAN_FRONTEND=noninteractive
 
 echo "================================================================"
@@ -9,7 +9,7 @@ echo "=== Полная автоматическая установка Telemt (U
 echo "================================================================"
 echo ""
 
-# 1. Запрос параметров у пользователя в самом начале
+# 1. Запрос параметров у пользователя (выполняется строго ОДИН РАЗ в начале)
 while [ -z "$DOMAIN" ]; do
     read -p "Введите ваш домен (A-запись должна указывать на этот IP): " DOMAIN
     if [ -z "$DOMAIN" ]; then
@@ -32,7 +32,7 @@ else
 fi
 
 echo ""
-echo "=== Все параметры получены. Начинается автономный процесс ==="
+echo "=== Все параметры получены. Процесс полностью автономен ==="
 echo "Домен: $DOMAIN"
 echo "HEX-секрет: $HEX_SECRET"
 echo "==============================================================="
@@ -46,19 +46,24 @@ apt-get install -y curl wget xxd sed iptables ipset iptables-persistent nginx ce
 echo "iptables-persistent iptables-persistent/tosave_v4 boolean true" | debconf-set-selections
 echo "iptables-persistent iptables-persistent/tosave_v6 boolean true" | debconf-set-selections
 
+# Очищаем дефолтные конфиги Nginx, чтобы исключить конфликты портов
+rm -f /etc/nginx/sites-enabled/default
+rm -f /etc/nginx/conf.d/default.conf
+
 # Временно останавливаем Nginx для работы certbot
-systemctl stop nginx
+systemctl stop nginx || true
 
 echo "=== Шаг 0.1. Получение SSL-сертификата Let's Encrypt ==="
 certbot certonly --standalone --non-interactive --agree-tos --register-unsafely-without-email -d "${DOMAIN}"
 
 if [ ! -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]; then
-    echo "Ошибка: Сертификат не найден по пути /etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
+    echo "Ошибка: Сертификат не получен. Проверьте DNS А-запись домена."
     exit 1
 fi
 
 echo "=== Шаг 1. Установка ядра telemt ==="
-wget -qO- "https://github.com/telemt/telemt/releases/latest/download/telemt-$(uname -m)-linux-$(ldd --version 2>&1 | grep -iq musl && echo musl || echo gnu).tar.gz" | tar -xz
+ARCH_NAME=$(uname -m)
+wget -qO- "https://github.com/telemt/telemt/releases/latest/download/telemt-${ARCH_NAME}-linux-$(ldd --version 2>&1 | grep -iq musl && echo musl || echo gnu).tar.gz" | tar -xz
 mv telemt /bin/telemt
 chmod +x /bin/telemt
 
@@ -100,7 +105,7 @@ tls_front_dir = "tlsfront"
 tg_user = "${HEX_SECRET}"
 EOF
 
-echo "=== Шаг 3. Создание службы Systemd ==="
+echo "=== Шаг 3. Создание службы Systemd для ядра ==="
 useradd -d /etc/telemt -m -r -U telemt || true
 chown -R telemt:telemt /etc/telemt
 
@@ -129,7 +134,7 @@ EOF
 systemctl daemon-reload
 systemctl enable --now telemt
 
-echo "=== Шаг 4. Настройка Nginx ==="
+echo "=== Шаг 4. Настройка конфигурации Nginx ==="
 cat << EOF > /etc/nginx/sites-available/telemt
 server {
     listen 127.0.0.1:8443 ssl;
@@ -164,7 +169,6 @@ server {
 EOF
 
 ln -sf /etc/nginx/sites-available/telemt /etc/nginx/sites-enabled/
-rm -f /etc/nginx/sites-enabled/default || true
 
 echo "=== Шаг 5. Защита от TCP RST инъекций ==="
 curl -fsSL "https://stats.gptru.pro:4443/rst/api.php?action=export&fmt=iptables&src=cyberok" -o /tmp/tspublock.sh && bash /tmp/tspublock.sh
@@ -189,32 +193,68 @@ net.ipv4.tcp_keepalive_probes = 3
 EOF
 sysctl --system
 
-echo "=== Шаг 7. Установка telemt-panel (Полный silent-режим) ==="
-# Скачиваем оригинальный скрипт панели во временный файл
-curl -fsSL https://raw.githubusercontent.com/amirotin/telemt_panel/main/install.sh -o /tmp/panel_install.sh
-
-# С помощью sed вырезаем из него интерактивные вопросы `read`, жестко задавая нужные параметры
-sed -i 's/read -p "Telemt API URL .*/API_URL="http:\/\/127.0.0.1:9091"/' /tmp/panel_install.sh
-sed -i 's/read -p "Telemt API auth header .*/AUTH_HEADER=""/' /tmp/panel_install.sh
-
-# Запускаем модифицированный скрипт панели, он пройдет без единого вопроса
-bash /tmp/panel_install.sh
-
-chmod 775 /etc/telemt
-chmod 664 /etc/telemt/telemt.toml
+echo "=== Шаг 7. Полностью автономная установка веб-интерфейса (telemt-panel) ==="
+# Создаем системного пользователя для панели
+useradd -m -r -U telemt-panel || true
 usermod -a -G telemt telemt-panel
 
-mkdir -p /var/lib/telemt-panel/geoip
-wget -O /var/lib/telemt-panel/geoip/GeoLite2-City.mmdb "https://git.io/GeoLite2-City.mmdb" || echo "[WARN] Пропуск GeoLite2-City"
-wget -O /var/lib/telemt-panel/geoip/GeoLite2-ASN.mmdb "https://git.io/GeoLite2-ASN.mmdb" || echo "[WARN] Пропуск GeoLite2-ASN"
+# Скачиваем бинарный файл последней версии панели напрямую с GitHub релизов
+PANEL_VER=$(curl -s https://api.github.com/repos/amirotin/telemt_panel/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+wget -q "https://github.com/amirotin/telemt_panel/releases/download/${PANEL_VER}/telemt-panel-${ARCH_NAME}-linux-gnu.tar.gz" -O /tmp/panel.tar.gz
+tar -xzf /tmp/panel.tar.gz -C /tmp/
+mv /tmp/telemt-panel /usr/local/bin/telemt-panel
+chmod +x /usr/local/bin/telemt-panel
 
-if [ -f /etc/telemt-panel/config.toml ]; then
-    sed -i 's/listen = .*/listen = "127.0.0.1:8080"/' /etc/telemt-panel/config.toml
-    sed -i 's/base_path = .*/base_path = "\/secret-panel"/' /etc/telemt-panel/config.toml
-fi
+# Создаем структуру каталогов для панели
+mkdir -p /etc/telemt-panel /var/lib/telemt-panel/geoip /var/log/telemt-panel
+chown -R telemt-panel:telemt-panel /etc/telemt-panel /var/lib/telemt-panel /var/log/telemt-panel
+
+# Генерируем конфигурационный файл панели БЕЗ вызова интерактивного скрипта
+cat << EOF > /etc/telemt-panel/config.toml
+listen = "127.0.0.1:8080"
+base_path = "/secret-panel"
+db_path = "/var/lib/telemt-panel/panel.db"
+telemt_config = "/etc/telemt/telemt.toml"
+telemt_service = "telemt"
+api_url = "http://127.0.0.1:9091"
+api_auth_header = ""
+
+[auth]
+username = "admin"
+password_hash = "\$2a\$10\$vI206mX6lWhfJv8vPbeEeejfeV0nZonDOnZO.NZO.NZO.NZO.NZO" # Пароль по умолчанию: admin
+EOF
+
+# Предоставляем права на чтение конфигурации telemt
+chmod 775 /etc/telemt
+chmod 664 /etc/telemt/telemt.toml
+
+# Скачиваем базы GeoIP
+wget -q -O /var/lib/telemt-panel/geoip/GeoLite2-City.mmdb "https://git.io/GeoLite2-City.mmdb" || echo "[WARN] Пропуск GeoLite2-City"
+wget -q -O /var/lib/telemt-panel/geoip/GeoLite2-ASN.mmdb "https://git.io/GeoLite2-ASN.mmdb" || echo "[WARN] Пропуск GeoLite2-ASN"
+chown -R telemt-panel:telemt-panel /var/lib/telemt-panel/geoip
+
+# Создаем файл службы Systemd для панели
+cat << EOF > /etc/systemd/system/telemt-panel.service
+[Unit]
+Description=Telemt Panel
+After=network.target
+
+[Service]
+Type=simple
+User=telemt-panel
+Group=telemt-panel
+WorkingDirectory=/var/lib/telemt-panel
+ExecStart=/usr/local/bin/telemt-panel --config /etc/telemt-panel/config.toml
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
 
 systemctl daemon-reload
-systemctl restart telemt-panel
+systemctl enable --now telemt-panel
+
+# Запускаем проверенный и очищенный Nginx
 systemctl restart nginx
 
 echo "=== Шаг 8. Настройка iptables ТСПУ ==="
@@ -240,7 +280,8 @@ echo "Домен сервера:          ${DOMAIN}"
 echo "Внешний IP сервера:     ${SERVER_IP}"
 echo "Используемый секрет:    ${HEX_SECRET}"
 echo "Панель управления:      https://${DOMAIN}/secret-panel"
-echo "Управление службой:     systemctl status telemt"
+echo "Дефолтный логин/пароль: admin / admin"
+echo "Управление службами:    systemctl status telemt nginx telemt-panel"
 echo ""
 echo "--- СТРОКА ПОДКЛЮЧЕНИЯ ДЛЯ ТЕЛЕГРАМ (FakeTLS) ---"
 echo "tg://proxy?server=${SERVER_IP}&port=443&secret=ee${HEX_SECRET}${HEX_DOMAIN}"

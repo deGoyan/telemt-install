@@ -105,6 +105,10 @@ tls_front_dir = "tlsfront"
 
 [access.users]
 tg_user = "${HEX_SECRET}"
+
+# Исправлено: добавлен критический таймаут для предотвращения сброса внешних веб-сессий
+[timeouts]
+client_handshake = 35
 EOF
 
 echo "=== Шаг 3. Создание службы Systemd для ядра ==="
@@ -205,8 +209,9 @@ server {
         try_files \$uri \$uri/ =404;
     }
 
+    # Исправлено: убран префикс в конце строки proxy_pass для корректного роутинга панели
     location /secret-panel/ {
-        proxy_pass http://127.0.0.1:8080/secret-panel/;
+        proxy_pass http://127.0.0.1:8080;
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
@@ -241,13 +246,13 @@ HEX_DOMAIN=$(echo -n "$DOMAIN" | xxd -p | tr -d '\n')
 
 echo ""
 echo "=============================================================================="
-echo "                       УСТАНОВКА УСПЕШНО ЗАВЕРШЕНА                            "
+echo "                        УСТАНОВКА УСПЕШНО ЗАВЕРШЕНА                           "
 echo "=============================================================================="
 echo ""
 echo "--- ДАННЫЕ ДЛЯ АДМИНИСТРИРОВАНИЯ ---"
 echo "Домен сервера:          ${DOMAIN}"
 echo "Используемый секрет:    ${HEX_SECRET}"
-echo "Панель управления:      https://${DOMAIN}/secret-panel"
+echo "Панель управления:      https://${DOMAIN}/secret-panel/"
 echo "Дефолтный логин/пароль: admin / (тот, что вы ввели в инсталляторе панели)"
 echo "Управление службами:    systemctl status telemt nginx telemt-panel"
 echo ""

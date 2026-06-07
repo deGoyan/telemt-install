@@ -5,7 +5,7 @@ set -e
 export DEBIAN_FRONTEND=noninteractive
 
 echo "================================================================"
-echo "=== Полная автоматическая установка Telemt (Ubuntu 24.04)   ==="
+echo "=== Тестовая автоматическая установка Telemt (Ubuntu 24.04) ==="
 echo "================================================================"
 echo ""
 
@@ -36,11 +36,11 @@ echo "=== Все параметры получены. Процесс полно�
 echo "Домен: $DOMAIN"
 echo "HEX-секрет: $HEX_SECRET"
 echo "==============================================================="
-sleep 2
+sleep 1
 
-echo "=== Шаг 0. Обновление ОС и установка компонентов ==="
+echo "=== Шаг 0. Установка только необходимых компонентов (без dist-upgrade) ==="
+# Обновление списков репозиториев оставлено, чтобы apt мог найти пакеты, но сами пакеты ОС не обновляются
 apt-get update -y
-apt-get upgrade -y -o Dpkg::Options::="--force-confold"
 apt-get install -y curl wget xxd sed iptables ipset iptables-persistent nginx certbot
 
 echo "iptables-persistent iptables-persistent/tosave_v4 boolean true" | debconf-set-selections
@@ -194,22 +194,18 @@ EOF
 sysctl --system
 
 echo "=== Шаг 7. Полностью автономная установка веб-интерфейса (telemt-panel) ==="
-# Создаем системного пользователя для панели
 useradd -m -r -U telemt-panel || true
 usermod -a -G telemt telemt-panel
 
-# Скачиваем бинарный файл последней версии панели напрямую с GitHub релизов
 PANEL_VER=$(curl -s https://api.github.com/repos/amirotin/telemt_panel/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
 wget -q "https://github.com/amirotin/telemt_panel/releases/download/${PANEL_VER}/telemt-panel-${ARCH_NAME}-linux-gnu.tar.gz" -O /tmp/panel.tar.gz
 tar -xzf /tmp/panel.tar.gz -C /tmp/
 mv /tmp/telemt-panel /usr/local/bin/telemt-panel
 chmod +x /usr/local/bin/telemt-panel
 
-# Создаем структуру каталогов для панели
 mkdir -p /etc/telemt-panel /var/lib/telemt-panel/geoip /var/log/telemt-panel
 chown -R telemt-panel:telemt-panel /etc/telemt-panel /var/lib/telemt-panel /var/log/telemt-panel
 
-# Генерируем конфигурационный файл панели БЕЗ вызова интерактивного скрипта
 cat << EOF > /etc/telemt-panel/config.toml
 listen = "127.0.0.1:8080"
 base_path = "/secret-panel"
@@ -221,19 +217,16 @@ api_auth_header = ""
 
 [auth]
 username = "admin"
-password_hash = "\$2a\$10\$vI206mX6lWhfJv8vPbeEeejfeV0nZonDOnZO.NZO.NZO.NZO.NZO" # Пароль по умолчанию: admin
+password_hash = "\$2a\$10\$vI206mX6lWhfJv8vPbeEeejfeV0nZonDOnZO.NZO.NZO.NZO.NZO" # Пароль: admin
 EOF
 
-# Предоставляем права на чтение конфигурации telemt
 chmod 775 /etc/telemt
 chmod 664 /etc/telemt/telemt.toml
 
-# Скачиваем базы GeoIP
 wget -q -O /var/lib/telemt-panel/geoip/GeoLite2-City.mmdb "https://git.io/GeoLite2-City.mmdb" || echo "[WARN] Пропуск GeoLite2-City"
 wget -q -O /var/lib/telemt-panel/geoip/GeoLite2-ASN.mmdb "https://git.io/GeoLite2-ASN.mmdb" || echo "[WARN] Пропуск GeoLite2-ASN"
 chown -R telemt-panel:telemt-panel /var/lib/telemt-panel/geoip
 
-# Создаем файл службы Systemd для панели
 cat << EOF > /etc/systemd/system/telemt-panel.service
 [Unit]
 Description=Telemt Panel
@@ -253,8 +246,6 @@ EOF
 
 systemctl daemon-reload
 systemctl enable --now telemt-panel
-
-# Запускаем проверенный и очищенный Nginx
 systemctl restart nginx
 
 echo "=== Шаг 8. Настройка iptables ТСПУ ==="
@@ -266,7 +257,6 @@ iptables -A INPUT -p tcp --dport 443 --syn -m recent --name mtproto --set -j ACC
 netfilter-persistent save
 iptables-save > /etc/iptables/rules.v4
 
-# Вывод финальных данных
 SERVER_IP=$(curl -s https://api.ipify.org || curl -s https://ifconfig.me || echo "IP_SERVER")
 HEX_DOMAIN=$(echo -n "$DOMAIN" | xxd -p | tr -d '\n')
 
